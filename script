@@ -1,0 +1,152 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Sklearn imports
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (OneHotEncoder, OrdinalEncoder, StandardScaler)
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import (train_test_split, cross_val_score, 
+                                     RandomizedSearchCV, GridSearchCV, KFold)
+from sklearn.linear_model import LogisticRegression, LinearRegression, SGDRegressor
+from sklearn.ensemble import (RandomForestClassifier, AdaBoostClassifier, 
+                              GradientBoostingClassifier, BaggingClassifier, 
+                              RandomForestRegressor)
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.svm import LinearSVC, SVR
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.metrics import (ConfusionMatrixDisplay, f1_score, 
+                             make_scorer, confusion_matrix, 
+                             mean_squared_error, mean_absolute_error)
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tools.tools import add_constant
+
+from xgboost import XGBClassifier, XGBRegressor
+from catboost import CatBoostClassifier
+
+from scipy.stats import randint, uniform
+
+
+# LOADING DATA
+
+raw_df = pd.read_csv('car_insurance_claim.csv')
+pd.set_option('display.max_columns', None)
+
+# Quick peek
+display(raw_df.head())
+
+# Check shape and duplicates
+print("Initial shape:", raw_df.shape)
+duplicates_count = raw_df.duplicated().sum()
+print("Duplicates:", duplicates_count)
+
+# Drop duplicates
+raw_df.drop_duplicates(inplace=True)
+print("Shape after dropping duplicates:", raw_df.shape)
+
+#RENAMING & BASIC COLUMN CLEANUP
+
+column_map = {
+    'KIDSDRIV': 'num_young_drivers',
+    'BIRTH': 'date_of_birth',
+    'AGE': 'age',
+    'HOMEKIDS': 'num_of_children',
+    'YOJ': 'years_job_held_for',
+    'INCOME': 'income',
+    'PARENT1': 'single_parent',
+    'HOME_VAL': 'value_of_home',
+    'MSTATUS': 'married',
+    'GENDER': 'gender',
+    'EDUCATION': 'highest_education',
+    'OCCUPATION': 'occupation',
+    'TRAVTIME': 'commute_dist',
+    'CAR_USE': 'type_of_use',
+    'BLUEBOOK': 'vehicle_value',
+    'TIF': 'policy_tenure',
+    'CAR_TYPE': 'vehicle_type',
+    'RED_CAR': 'red_vehicle',
+    'OLDCLAIM': 'fiveyr_claims_val',
+    'CLM_FREQ': 'fiveyr_claims_num',
+    'REVOKED': 'licence_revoked',
+    'MVR_PTS': 'license_points',
+    'CLM_AMT': 'new_claim_value',
+    'CAR_AGE': 'vehicle_age',
+    'CLAIM_FLAG': 'is_claim',
+    'URBANICITY': 'address_type'
+}
+
+data_df = raw_df.copy()
+data_df.rename(columns=column_map, inplace=True)
+
+# If ID/date_of_birth exist, remove them
+for drop_col in ['ID', 'date_of_birth']:
+    if drop_col in data_df.columns:
+        data_df.drop(drop_col, axis=1, inplace=True)
+
+print("\nAfter renaming/dropping columns, columns are now:")
+print(data_df.columns)
+
+currency_cols = [
+    'income', 'value_of_home', 
+    'vehicle_value', 'fiveyr_claims_val', 
+    'new_claim_value'
+]
+
+# Example function to strip currency formatting
+def clean_currency_values(df, cols):
+    
+    for c in cols:
+        df[c] = df[c].replace('[\\$,]', '', regex=True).astype('Int64')
+    return df
+
+data_df = clean_currency_values(data_df, currency_cols)
+
+# If any columns have 'z_' prefix, remove them
+z_prefix_cols = [
+    'married', 'gender', 'highest_education', 
+    'occupation', 'vehicle_type', 'address_type'
+]
+
+def strip_z_prefix(df, cols):
+    
+    for c in cols:
+        df[c] = df[c].replace('[z_]', '', regex=True)
+    return df
+
+data_df = strip_z_prefix(data_df, z_prefix_cols)
+
+print("\nPreview of dataset after cleaning:")
+display(data_df.head())
+
+# Convert new_claim_value to numeric; drop rows if it's missing
+data_df['new_claim_value'] = pd.to_numeric(data_df['new_claim_value'], errors='coerce')
+data_df.dropna(subset=['new_claim_value'], inplace=True)
+
+# Binning claim values (linear bins)
+bins_linear = [0.0, 5000, 10000, 15000, 20000, 
+               25000, 30000, 35000, 40000, 
+               45000, 50000, np.inf]
+labels_linear = np.arange(1, len(bins_linear))
+data_df['claim_value_cat'] = pd.cut(
+    data_df['new_claim_value'], 
+    bins=bins_linear, 
+    labels=labels_linear, 
+    include_lowest=True
+)
+
+# Binning claim values (log-scale) for EDA
+log_bins = np.logspace(
+    0, 
+    np.log10(data_df['new_claim_value'].max()), 
+    num=12
+)
+log_labels = [f"Bin {i}" for i in range(1, len(log_bins))]
+data_df['log_claim_value_cat'] = pd.cut(
+    data_df['new_claim_value'], 
+    bins=log_bins, 
+    labels=log_labels, 
+    include_lowest=True
+)
