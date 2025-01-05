@@ -81,7 +81,8 @@ column_map = {
 data_df = raw_df.copy()
 data_df.rename(columns=column_map, inplace=True)
 
-# If ID/date_of_birth exist, remove them
+# Removing ID and date_of_birth
+
 for drop_col in ['ID', 'date_of_birth']:
     if drop_col in data_df.columns:
         data_df.drop(drop_col, axis=1, inplace=True)
@@ -121,7 +122,7 @@ data_df = strip_z_prefix(data_df, z_prefix_cols)
 print("\nPreview of dataset after cleaning:")
 display(data_df.head())
 
-# Convert new_claim_value to numeric; drop rows if it's missing
+# Convert new_claim_value to numeric; drop missing rows
 data_df['new_claim_value'] = pd.to_numeric(data_df['new_claim_value'], errors='coerce')
 data_df.dropna(subset=['new_claim_value'], inplace=True)
 
@@ -284,5 +285,358 @@ ax.set_ylabel("CV Accuracy", fontsize=12)
 ax.set_title("Accuracy Distribution (10-fold CV) for Various Models", fontsize=14)
 plt.show()
 
+# FULL PREPROCESSING , XGBOOST , RANDOMIZEDSEARCHCV
 
+# final pipeline approach using ColumnTransformer
+from sklearn import set_config
+set_config(transform_output='pandas')  #  pipeline returns DataFrame
+
+#  numeric pipeline
+sqrt_features = ['income', 'value_of_home', 'commute_dist', 
+                 'vehicle_value', 'policy_tenure', 'license_points']
+
+class SqrtTransform(BaseEstimator, TransformerMixin):
+    
+    def __init__(self, columns):
+        self.columns = columns
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        X = X.copy()
+        for col in self.columns:
+            X[col] = np.sqrt(np.maximum(X[col], 0))
+        return X
+
+numeric_pipeline = Pipeline([
+    ('knn_impute', KNNImputer(n_neighbors=2)),
+    ('sqrt_trans', SqrtTransform(sqrt_features)),
+    ('scaler', StandardScaler())
+])
+
+# Ordinal pipeline
+ord_pipeline = Pipeline([
+    ('simp_impute', SimpleImputer(strategy='most_frequent')),
+    ('ord_enc', OrdinalEncoder(categories=ord_cats_example))
+])
+
+# Binary pipeline
+bin_pipeline = Pipeline([
+    ('simp_impute', SimpleImputer(strategy='most_frequent')),
+    ('bin_enc', OrdinalEncoder())
+])
+
+# OHE pipeline
+ohe_pipeline = Pipeline([
+    ('simp_impute', SimpleImputer(strategy='most_frequent')),
+    ('ohe', OneHotEncoder(drop='first', handle_unknown='ignore', sparse_output=False))
+])
+
+# drop columns:
+class ColumnRemover(BaseEstimator, TransformerMixin):
+    def __init__(self, cols_to_remove):
+        self.cols_to_remove = cols_to_remove
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        return X.drop(columns=self.cols_to_remove, errors='ignore')
+
+cols_to_remove = ['red_vehicle']
+
+# ColumnTransformer
+full_preprocessor = ColumnTransformer([
+    ('col_drop', ColumnRemover(cols_to_remove), cols_to_remove),
+    ('num_pipe', numeric_pipeline, numeric_cols_list),
+    ('ord_pipe', ord_pipeline, ord_cols_example),
+    ('bin_pipe', bin_pipeline, bin_cols_example),
+    ('ohe_pipe', ohe_pipeline, onehot_cols_example)
+], remainder='drop')
+
+# Final pipeline with XGBClassifier
+from sklearn.metrics import make_scorer
+
+xgb_clf_pipeline = Pipeline([
+    ('preprocess', full_preprocessor),
+    ('xgb_clf', XGBClassifier(random_state=42, eval_metric='error'))
+])
+
+param_dist = {
+    'xgb_clf__n_estimators': randint(50, 200),
+    'xgb_clf__max_depth': randint(3, 10),
+    'xgb_clf__learning_rate': uniform(0.01, 0.15),
+}
+
+rand_scorer = make_scorer(f1_score, average='weighted')
+rand_search = RandomizedSearchCV(
+    estimator=xgb_clf_pipeline,
+    param_distributions=param_dist,
+    n_iter=30,
+    cv=5,
+    scoring=rand_scorer,
+    random_state=42,
+    verbose=1,
+    n_jobs=-1
+)
+
+rand_search.fit(X_train, y_train)
+print("Best Random Search Params:", rand_search.best_params_)
+print("Best Weighted F1 Score:", rand_search.best_score_)
+
+# Evaluate on test set
+X_test_prepared = rand_search.best_estimator_['preprocess'].transform(X_test)
+y_test_pred = rand_search.best_estimator_['xgb_clf'].predict(X_test_prepared)
+final_f1 = f1_score(y_test, y_test_pred, average='weighted')
+print(f"Final Test Weighted-F1: {final_f1:.4f}")
+
+cm = confusion_matrix(y_test, y_test_pred)
+ConfusionMatrixDisplay(cm).plot()
+plt.title("XGB - Confusion Matrix on Test")
+plt.show()
+
+
+# REGRESSION FLOW
+
+# Filter rows with new_claim_value > 0 for regression
+reg_data = data_df[data_df['new_claim_value'] > 0].copy()
+X_reg = reg_data.drop(columns=['new_claim_value','is_claim','claim_value_cat'], errors='ignore')
+y_reg = reg_data['new_claim_value']
+
+X_train_reg, X_test_reg, y_train_reg, y_test_reg = train_test_split(
+    X_reg, 
+    y_reg,
+    test_size=0.2,
+    random_state=42
+)
+
+# swaping in a regressor
+from sklearn.ensemble import RandomForestRegressor
+
+rf_reg_pipeline = Pipeline([
+    ('preprocess', full_preprocessor),
+    ('rf_reg', RandomForestRegressor(random_state=42))
+])
+
+# Cross-validate
+kf_reg = KFold(n_splits=5, shuffle=True, random_state=42)
+neg_rmse = cross_val_score(
+    rf_reg_pipeline, 
+    X_train_reg, 
+    y_train_reg,
+    cv=kf_reg,
+    scoring='neg_root_mean_squared_error'
+)
+rmse_scores = -neg_rmse
+print(f"RF Regressor - CV RMSE: {rmse_scores.mean():.2f} (+/- {rmse_scores.std():.2f})")
+
+# Fit final & evaluate on test
+rf_reg_pipeline.fit(X_train_reg, y_train_reg)
+X_test_reg_prepared = rf_reg_pipeline['preprocess'].transform(X_test_reg)
+y_pred_reg = rf_reg_pipeline['rf_reg'].predict(X_test_reg_prepared)
+
+rmse_final = np.sqrt(mean_squared_error(y_test_reg, y_pred_reg))
+mae_final = mean_absolute_error(y_test_reg, y_pred_reg)
+print(f"Test RMSE: {rmse_final:.2f}, Test MAE: {mae_final:.2f}")
+
+# DETERMINING CORELATION 
+
+corr_matrix = eda_df.corr(numeric_only=True)
+
+corr_with_target = corr_matrix['is_claim'].sort_values(ascending=False)
+print("Correlation with is_claim:\n", corr_with_target)
+
+# Inspect the first few rows of the original training data
+print(X_train.head())
+
+# TEST A SINGLE NEW DATA SAMPLE
+
+
+#  Define a dictionary matching ALL columns preprocessor expects:
+#    - numeric_feats
+#    - ord_cols
+#    - bin_cols
+#    - nom_cols
+#    - *plus any others* if needed.
+
+# For illustration, here’s an example that uses the columns :
+sample_data = {
+    # Numeric columns (some examples)
+    "age": [19],
+    "income": [25800.0],
+    "value_of_home": [150000.0],
+    "vehicle_value": [8000.0],
+    "fiveyr_claims_val": [5800.0],
+    "fiveyr_claims_num": [3],
+    "license_points": [2],
+    "vehicle_age": [5.0],
+    "commute_dist": [25],
+    "policy_tenure": [3],
+    "years_job_held_for": [6.0],
+    "num_of_children": [1],
+    "num_young_drivers": [0],
+    
+    # Ordinal column (example: highest_education)
+    # Must match one of the categories: '<High School','High School','Bachelors','Masters','PhD'
+    "highest_education": ["Masters"],
+    
+    # Binary columns
+    # Must match the strings pipeline expects (e.g., "Yes"/"No", "Urban"/"Rural", "M"/"F", etc.)
+    "single_parent": ["No"],
+    "red_vehicle" : ["No"],
+    "married": ["Yes"],
+    "gender": ["F"],
+    "type_of_use": ["Private"],
+    "licence_revoked": ["Yes"],
+    "address_type": ["Highly Urban/ Urban"],   # or whatever category is in data
+    
+    # Nominal columns (One-Hot)
+    # Make sure they match what pipeline saw in training:
+    "occupation": ["Student"],
+    "vehicle_type": ["SUV"]
+}
+
+# Converting that dictionary into a single-row DataFrame:
+sample_df = pd.DataFrame(sample_data)
+
+# Using best estimator (found by RandomizedSearchCV) to predict
+best_model = rand_search.best_estimator_  # This is clf_pipeline with best hyperparams
+sample_pred = best_model.predict(sample_df)  # This outputs array([0]) or array([1]), etc.
+
+# Interpreting the result
+if sample_pred[0] == 1:
+    print(">>> Prediction: A claim WILL be made (is_claim = 1).")
+else:
+    print(">>> Prediction: NO claim (is_claim = 0).")
+
+claim_amount = rand_search.best_estimator_.predict(sample_df)
+print(f"Estimated Claim Amount: {claim_amount[0]}")
+
+#Binary to Continious 
+
+reg_data = data_df[data_df['new_claim_value'] > 0].copy()
+X_reg = reg_data.drop(columns=['new_claim_value','is_claim'])
+y_reg = reg_data['new_claim_value']
+
+rf_reg_pipeline = Pipeline([
+    ('preprocess', full_preprocessor),
+    ('rf_reg', XGBRegressor(random_state=42))
+])
+
+param_dist_reg = {
+    'rf_reg__n_estimators': randint(50, 300),
+    'rf_reg__max_depth': randint(1, 10),
+    'rf_reg__learning_rate': uniform(0.01, 0.3),
+    # etc.
+}
+
+rand_search_reg = RandomizedSearchCV(
+    rf_reg_pipeline, 
+    param_distributions=param_dist_reg,
+    scoring='neg_root_mean_squared_error',
+    cv=5,
+    n_iter=30,
+    random_state=42,
+    n_jobs=-1
+)
+rand_search_reg.fit(X_reg, y_reg)
+
+rand_search_reg.best_params_      # The parameter settings 
+rand_search_reg.best_score_       # The best (neg_root_mean_squared_error) 
+rand_search_reg.cv_results_       # Detailed info about each parameter combo
+
+best_neg_rmse = rand_search_reg.best_score_  
+best_rmse = -best_neg_rmse      
+
+print("Best params:", rand_search_reg.best_params_)
+
+best_neg_rmse = rand_search_reg.best_score_   # e.g. -7700
+best_rmse = -best_neg_rmse                    # 7700
+print("Best RMSE:", best_rmse)
+
+# Extract cv_results_ from the RandomizedSearchCV object
+cv_results = rand_search_reg.cv_results_
+
+# Convert to DataFrame for easier manipulation
+results_df = pd.DataFrame(cv_results)
+
+# Sort by rank_test_score (ascending means 1 is best)
+sorted_results_df = results_df.sort_values(by='rank_test_score')
+
+# Pick the top 4
+top_4 = sorted_results_df.head(4)
+
+print("Top 4 candidates:")
+display(top_4[[
+    'rank_test_score', 
+    'mean_test_score',
+    'param_rf_reg__n_estimators',
+    'param_rf_reg__max_depth',
+    'param_rf_reg__learning_rate'
+]])
+
+top_4['rmse'] = -top_4['mean_test_score']
+
+import matplotlib.pyplot as plt
+
+# renaming each row with a short label, e.g. "Candidate #1" ...
+top_4['candidate'] = [f"Candidate #{i+1}" for i in range(len(top_4))]
+
+plt.figure(figsize=(8, 5))
+plt.bar(top_4['candidate'], top_4['rmse'], color='skyblue')
+plt.xlabel('Top 4 Candidates')
+plt.ylabel('RMSE (lower is better)')
+plt.title('Comparison of Top 4 Models by RMSE')
+plt.ylim([top_4['rmse'].min()*0.95, top_4['rmse'].max()*1.05])  # some padding
+plt.show()
+
+# Example: RandomizedSearchCV for regression called rand_search_reg
+# Fit on df where new_claim_value > 0
+
+sample_data_reg = {
+    # All columns pipeline expects for regression.
+    # For instance:
+    "age": [19],
+    "income": [60000.0],
+    "value_of_home": [150000.0],
+    "vehicle_value": [12000.0],
+    "fiveyr_claims_val": [1000.0],
+    "fiveyr_claims_num": [1],
+    "license_points": [2],
+    "vehicle_age": [3.0],
+    "commute_dist": [30],
+    "policy_tenure": [5],
+    "years_job_held_for": [10.0],
+    "num_of_children": [2],
+    "num_young_drivers": [0],
+
+    "highest_education": ["Bachelors"],
+    "single_parent": ["No"],
+    "red_vehicle" : ["No"],
+    "married": ["Yes"],
+    "gender": ["M"],
+    "type_of_use": ["Private"],
+    "licence_revoked": ["No"],
+    "address_type": ["Highly Urban/ Urban"],
+    "occupation": ["Professional"],
+    "vehicle_type": ["SUV"]
+}
+
+import pandas as pd
+sample_df_reg = pd.DataFrame(sample_data_reg)
+
+# Instead of rand_search (the classifier), use rand_search_reg or 
+# whichever variable references regression pipeline
+claim_amount = rand_search_reg.best_estimator_.predict(sample_df_reg)
+
+print(f"Estimated Claim Amount: {claim_amount[0]:.2f}")
+
+# Predict on the same or a test subset
+y_pred_reg = rand_search_reg.best_estimator_.predict(X_reg)
+
+# Scatter plot (continuous)
+import matplotlib.pyplot as plt
+
+plt.scatter(y_reg, y_pred_reg, alpha=0.7)
+plt.xlabel("Actual Claim Amount")
+plt.ylabel("Predicted Claim Amount")
+plt.title("Regression - Actual vs. Predicted Claim Amounts")
+plt.show()
 
