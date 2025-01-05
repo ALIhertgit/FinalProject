@@ -150,3 +150,139 @@ data_df['log_claim_value_cat'] = pd.cut(
     labels=log_labels, 
     include_lowest=True
 )
+
+X_all = data_df.copy()
+y_all = data_df['is_claim']
+
+# drop the target columns from X
+X_all.drop(columns=['new_claim_value', 'is_claim'], inplace=True)
+
+# Basic split
+X_train, X_test, y_train, y_test = train_test_split(
+    X_all, 
+    y_all, 
+    test_size=0.2, 
+    random_state=42,
+    stratify=X_all['claim_value_cat'] 
+)
+
+# DATA INSPECTION: CORRELATION / QUICK EDA
+
+# Example correlation check on the training set
+eda_df = X_train.copy()
+eda_df['is_claim'] = y_train
+
+print("\nCorrelation with 'is_claim':")
+corr_vals = eda_df.corr(numeric_only=True)['is_claim'].sort_values(ascending=False)
+print(corr_vals)
+
+# IMPUTATION EXAMPLE (KNN FOR NUMERIC, SIMPLE FOR CATEGORICAL)
+
+X_train_raw = X_train.copy()
+
+# 1) KNN Imputer for numeric columns
+knn_imputer = KNNImputer(n_neighbors=2)
+numeric_cols_list = X_train_raw.select_dtypes(include=[np.number]).columns.tolist()
+
+def knn_impute_numeric(df, numeric_cols, imputer):
+    
+    sub_df = df[numeric_cols]
+    imputed_arr = imputer.fit_transform(sub_df)
+    imputed_df = pd.DataFrame(imputed_arr, columns=numeric_cols)
+    return imputed_df
+
+X_num_imputed = knn_impute_numeric(X_train_raw, numeric_cols_list, knn_imputer)
+
+# 2) Simple Imputer for categorical columns
+cat_cols_list = X_train_raw.select_dtypes(include=['object']).columns.tolist()
+sim_imputer = SimpleImputer(strategy='most_frequent')
+
+def simple_impute_categorical(df, cat_cols, imputer):
+    
+    sub_df = df[cat_cols]
+    cat_imputed_arr = imputer.fit_transform(sub_df)
+    cat_imputed_df = pd.DataFrame(cat_imputed_arr, columns=cat_cols)
+    return cat_imputed_df
+
+X_cat_imputed = simple_impute_categorical(X_train_raw, cat_cols_list, sim_imputer)
+
+# Re-assemble numeric + categorical
+X_train_imputed = pd.concat([X_num_imputed, X_cat_imputed], axis=1)
+
+# ENCODING EXAMPLE (ORDINAL, BINARY, ONE-HOT)
+
+# columns:
+ord_cols_example = ['highest_education']
+ord_cats_example = [['<High School','High School','Bachelors','Masters','PhD']]
+
+bin_cols_example = ['single_parent','married','gender','type_of_use',
+                    'licence_revoked','address_type']
+
+onehot_cols_example = ['occupation','vehicle_type']
+
+# Fit each encoder
+oe = OrdinalEncoder(categories=ord_cats_example)
+be = OrdinalEncoder()
+ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+
+encoded_ord = oe.fit_transform(X_cat_imputed[ord_cols_example])
+encoded_bin = be.fit_transform(X_cat_imputed[bin_cols_example])
+encoded_ohe = ohe.fit_transform(X_cat_imputed[onehot_cols_example])
+
+# Convert arrays to DataFrame
+df_ord = pd.DataFrame(encoded_ord, columns=ord_cols_example)
+df_bin = pd.DataFrame(encoded_bin, columns=bin_cols_example)
+df_ohe = pd.DataFrame(encoded_ohe, columns=ohe.get_feature_names_out(onehot_cols_example))
+
+# Combine everything
+X_train_encoded = pd.concat([
+    X_num_imputed.reset_index(drop=True), 
+    df_ord.reset_index(drop=True),
+    df_bin.reset_index(drop=True),
+    df_ohe.reset_index(drop=True)
+], axis=1)
+
+# VIF CHECK 
+
+def compute_vif(df):
+    
+    cdf = add_constant(df)
+    vif_data = []
+    for i in range(cdf.shape[1]):
+        vif_data.append(variance_inflation_factor(cdf.values, i))
+    return pd.DataFrame({'Feature': cdf.columns, 'VIF': vif_data})
+
+vif_result = compute_vif(X_train_encoded)
+display(vif_result)
+
+# MODEL COMPARISON (CLASSIFIERS)
+clf_candidates = [
+    ('LogisticReg', LogisticRegression(solver='liblinear', max_iter=2000)),
+    ('KNeighbors', KNeighborsClassifier()),
+    ('DecisionTree', DecisionTreeClassifier()),
+    ('RandForest', RandomForestClassifier(random_state=42)),
+    ('LinearSVM', LinearSVC(random_state=42, dual='auto')),
+    ('XGBoost', XGBClassifier(random_state=42)),
+    ('AdaBoost', AdaBoostClassifier(random_state=42, algorithm='SAMME')),
+    ('GradBoost', GradientBoostingClassifier(random_state=42)),
+    ('Bagging', BaggingClassifier(random_state=42)),
+    ('CatBoost', CatBoostClassifier(random_state=42, verbose=0))
+]
+
+cv_kf = KFold(n_splits=10, shuffle=True, random_state=42)
+
+results_dict = {}
+for name, model in clf_candidates:
+    scores = cross_val_score(model, X_train_encoded, y_train, cv=cv_kf)
+    results_dict[name] = scores
+
+results_df = pd.DataFrame(results_dict)
+fig, ax = plt.subplots(figsize=(14, 8))
+sns.boxplot(data=results_df, ax=ax)
+ax.set_xlabel("Classifier", fontsize=12)
+ax.set_ylabel("CV Accuracy", fontsize=12)
+ax.set_title("Accuracy Distribution (10-fold CV) for Various Models", fontsize=14)
+plt.show()
+
+
+
